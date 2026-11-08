@@ -12,6 +12,7 @@
 namespace Mcp\Server;
 
 use Mcp\Capability\Completion\ProviderInterface;
+use Mcp\Capability\DeferredRegistryInterface;
 use Mcp\Capability\Discovery\CachedDiscoverer;
 use Mcp\Capability\Discovery\Discoverer;
 use Mcp\Capability\Discovery\DiscovererInterface;
@@ -20,6 +21,7 @@ use Mcp\Capability\Discovery\SchemaValidator;
 use Mcp\Capability\Registry;
 use Mcp\Capability\Registry\Container;
 use Mcp\Capability\Registry\ElementReference;
+use Mcp\Capability\Registry\LazyRegistry;
 use Mcp\Capability\Registry\Loader\ChainLoader;
 use Mcp\Capability\Registry\Loader\DiscoveryLoader;
 use Mcp\Capability\Registry\Loader\ExplicitElementLoader;
@@ -276,7 +278,7 @@ final class Builder
 
     private bool $hasCustomRegistry = false;
 
-    private bool $lazyLoading = true;
+    private ?bool $lazyLoading = null;
 
     private bool $headerValidation = true;
 
@@ -589,8 +591,8 @@ final class Builder
      *
      * Lazy (the default) defers loading to the first registry read so a persistent runtime does not
      * freeze the registry to a source not yet ready at build time. Disable to load eagerly at build.
-     * A registry supplied via setRegistry() is always loaded eagerly; its own constructor loader,
-     * if it has one, still runs on the first read.
+     * A registry supplied via setRegistry() is loaded at build unless lazy loading is asked for explicitly.
+     * Then it stays unloaded until the server first reads it, also for code holding the same instance.
      */
     public function setLazyLoading(bool $lazyLoading = true): self
     {
@@ -1140,29 +1142,32 @@ final class Builder
 
         $chainLoader = new ChainLoader($loaders);
 
-        if ($this->hasCustomRegistry) {
-            // Builder can't inject the loader into an already-constructed instance, so load it eagerly.
-            // Via loadFrom(), which suppresses the change events the load would otherwise dispatch.
+        $prepopulated = null;
+        if ($this->hasCustomRegistry && true === $this->lazyLoading) {
+            $prepopulated = $this->registry;
+            $registry = new LazyRegistry($prepopulated, $chainLoader);
+            $eagerlyLoaded = false;
+        } elseif ($this->hasCustomRegistry) {
             $registry = $this->registry;
-            if ($registry instanceof Registry) {
+            if ($registry instanceof DeferredRegistryInterface) {
                 $registry->loadFrom($chainLoader);
             } else {
                 $chainLoader->load($registry);
             }
             $eagerlyLoaded = true;
         } else {
+            $eagerlyLoaded = false === $this->lazyLoading;
             $registry = new Registry($eventDispatcher, $logger, loader: $chainLoader);
-            if (!$this->lazyLoading) {
+            if ($eagerlyLoaded) {
                 $registry->load();
             }
-            $eagerlyLoaded = !$this->lazyLoading;
         }
 
         $messageFactory = MessageFactory::make(additional: $this->extensionMessages);
         // `server/discover` exists in the modern era only.
         $modernMessageFactory = MessageFactory::make(additional: [...$this->extensionMessages, DiscoverRequest::class]);
 
-        $capabilities = $this->serverCapabilities ?? $this->detectCapabilities($registry, $eagerlyLoaded);
+        $capabilities = $this->serverCapabilities ?? $this->detectCapabilities($registry, $eagerlyLoaded, $prepopulated);
 
         // Extensions enabled via enableExtension() are folded into caller-supplied
         // capabilities too, so setCapabilities() does not silently drop them.
@@ -1218,8 +1223,10 @@ final class Builder
      * When loaded, capabilities are read from the registry. When deferred, reading it would force
      * the load, so they are advertised from the configured sources instead — opaque sources (custom
      * loaders, discovery) advertise all kinds, and over-advertising is harmless per MCP semantics.
+     * $prepopulated is a supplied registry waiting for the deferred load. It is read directly, unless
+     * a load of its own is pending, which makes it an opaque source too.
      */
-    private function detectCapabilities(RegistryInterface $registry, bool $eagerlyLoaded): ServerCapabilities
+    private function detectCapabilities(RegistryInterface $registry, bool $eagerlyLoaded, ?RegistryInterface $prepopulated = null): ServerCapabilities
     {
         // Only the bus delivers list changes, and only if the registry publishes to it.
         $listChanged = null !== $this->notificationBus && $registry->publishesListChanges();
@@ -1241,16 +1248,18 @@ final class Builder
             );
         }
 
-        $hasOpaqueSources = [] !== $this->loaders || null !== $this->discoveryBasePath;
-        $hasResources = [] !== $this->resources || [] !== $this->explicitResources || [] !== $this->resourceTemplates || [] !== $this->explicitResourceTemplates || $hasOpaqueSources;
+        $hasOpaqueSources = [] !== $this->loaders || null !== $this->discoveryBasePath
+            || ($prepopulated instanceof DeferredRegistryInterface && !$prepopulated->isLoaded());
+        $hasResources = [] !== $this->resources || [] !== $this->explicitResources || [] !== $this->resourceTemplates || [] !== $this->explicitResourceTemplates || $hasOpaqueSources
+            || ($prepopulated?->hasResources() ?? false) || ($prepopulated?->hasResourceTemplates() ?? false);
 
         return new ServerCapabilities(
-            tools: [] !== $this->tools || [] !== $this->explicitTools || $hasOpaqueSources,
+            tools: [] !== $this->tools || [] !== $this->explicitTools || $hasOpaqueSources || ($prepopulated?->hasTools() ?? false),
             toolsListChanged: $listChanged,
             resources: $hasResources,
             resourcesSubscribe: $hasResources,
             resourcesListChanged: $listChanged,
-            prompts: [] !== $this->prompts || [] !== $this->explicitPrompts || $hasOpaqueSources,
+            prompts: [] !== $this->prompts || [] !== $this->explicitPrompts || $hasOpaqueSources || ($prepopulated?->hasPrompts() ?? false),
             promptsListChanged: $listChanged,
             logging: true,
             completions: true,

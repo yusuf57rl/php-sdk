@@ -40,7 +40,7 @@ use Psr\Log\NullLogger;
  *
  * @author Kyrian Obikwelu <koshnawaza@gmail.com>
  */
-final class Registry implements RegistryInterface
+final class Registry implements RegistryInterface, DeferredRegistryInterface
 {
     /**
      * @var array<string, ToolReference>
@@ -92,6 +92,11 @@ final class Registry implements RegistryInterface
         $this->loadFrom($this->loader);
 
         $this->loaded = true;
+    }
+
+    public function isLoaded(): bool
+    {
+        return $this->loaded || null === $this->loader;
     }
 
     /**

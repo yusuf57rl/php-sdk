@@ -622,6 +622,64 @@ final class BuilderTest extends TestCase
             ->addTool(static fn (): string => 'ok', 'alpha')
             ->build();
     }
+
+    public function testASuppliedRegistryStaysEagerByDefault(): void
+    {
+        $registry = new Registry();
+
+        Server::builder()
+            ->setRegistry($registry)
+            ->addTool(static fn (): string => 'ok', 'alpha')
+            ->build();
+
+        $this->assertTrue($registry->hasTool('alpha'));
+    }
+
+    public function testASuppliedRegistryIsDeferredWhenLazyLoadingIsAskedFor(): void
+    {
+        $loader = $this->createMock(LoaderInterface::class);
+        $loader->expects($this->never())->method('load');
+
+        $server = Server::builder()
+            ->setRegistry(new Registry())
+            ->setLazyLoading()
+            ->addLoader($loader)
+            ->build();
+
+        $this->assertTrue($this->extractServerCapabilities($server)->tools);
+    }
+
+    public function testADeferredRegistryWithItsOwnLoaderIsNotLoadedByCapabilityDetection(): void
+    {
+        $loader = $this->createMock(LoaderInterface::class);
+        $loader->expects($this->never())->method('load');
+
+        $capabilities = $this->extractServerCapabilities(Server::builder()
+            ->setRegistry(new Registry(loader: $loader))
+            ->setLazyLoading()
+            ->build());
+
+        $this->assertTrue($capabilities->tools);
+        $this->assertTrue($capabilities->resources);
+        $this->assertTrue($capabilities->prompts);
+    }
+
+    public function testADeferredThirdPartyRegistryKeepsAdvertisingWhatItAlreadyHolds(): void
+    {
+        $registry = $this->createMock(RegistryInterface::class);
+        $registry->expects($this->never())->method('registerTool');
+        $registry->method('hasPrompts')->willReturn(true);
+
+        $capabilities = $this->extractServerCapabilities(Server::builder()
+            ->setRegistry($registry)
+            ->setLazyLoading()
+            ->addTool(static fn (): string => 'ok', 'alpha')
+            ->build());
+
+        $this->assertTrue($capabilities->tools);
+        $this->assertTrue($capabilities->prompts);
+        $this->assertFalse($capabilities->resources);
+    }
 }
 
 /**
